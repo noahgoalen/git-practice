@@ -111,7 +111,9 @@ def fit(X, y, weights, penalty, n_fixed):
     beta = np.zeros(X.shape[1])
     beta[0] = math.log(np.average(y, weights=weights))
     ridge = np.full(X.shape[1], float(penalty))
-    ridge[:n_fixed] = 0
+    # A negligible penalty keeps the fit solvable when a fixed term has no
+    # data yet, e.g. promoted teams before the second season.
+    ridge[:n_fixed] = 1e-6
     for _ in range(50):
         mu = np.exp(X @ beta)
         gradient = X.T @ (weights * (y - mu)) - ridge * beta

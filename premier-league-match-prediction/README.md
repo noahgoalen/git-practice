@@ -9,4 +9,5 @@ pip install -r requirements.txt
 python download_results.py   # 10 seasons -> premier_league_results.csv
 python split_data.py         # -> train.csv (7), validation.csv (2), test.csv (1)
 python predict_scores.py     # Poisson model; prints test metrics, writes test_predictions.csv
+python average_model.py      # average-goals model; compares with Poisson, writes test_predictions_average.csv
 ```

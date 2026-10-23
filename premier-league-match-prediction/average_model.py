@@ -1,14 +1,22 @@
 """Predict scores from each team's average goals in its previous matches.
 
-For each match, a team's predicted goals is the average number of goals it
-scored in its previous matches (home and away alike), rounded to the nearest
-whole number. The predicted result follows from the two rounded scores, so
-equal scores mean a draw.
+Each team has two ratings, taken from its previous matches (home and away
+alike):
+    offensive rating: average goals it scored
+    defensive rating: average goals it conceded (higher is worse)
+
+Two ways of predicting a team's goals in a match are compared:
+    "Scored only":       its offensive rating
+    "Offence + defence": the average of its offensive rating and the
+                         opponent's defensive rating
+The prediction is rounded to the nearest whole number, and the predicted
+result follows from the two rounded scores, so equal scores mean a draw.
 
 "Previous matches" can be every earlier match in the data or only the most
 recent few. The window is chosen on the validation seasons (by how often the
-result is right), then the test season is predicted once with it. Only matches
-before the one being predicted are ever used.
+result is right), separately for each method, then the test season is
+predicted once with it. Only matches before the one being predicted are ever
+used.
 
 Run split_data.py (and predict_scores.py, for the comparison) first, then:
     python average_model.py
@@ -39,36 +47,59 @@ def result(home_goals, away_goals):
     return "D" if home_goals == away_goals else "A"
 
 
-def predict(matches, window):
-    """Average-goals prediction for every match, using only earlier matches.
+def ratings(matches, window):
+    """Each team's (offensive, defensive) rating before every match.
 
-    Matches on the same day are predicted before any of them are added to the
-    history. A team with no earlier matches gets the average goals per team
-    of all earlier matches.
+    Returns one ((home off, home def), (away off, away def)) per match, using
+    only earlier matches. Matches on the same day are rated before any of
+    them are added to the history. A team with no earlier matches gets the
+    average goals per team of all earlier matches for both ratings.
     """
-    history = {}  # team -> goals scored in each earlier match, oldest first
+    scored = {}    # team -> goals scored in each earlier match, oldest first
+    conceded = {}  # team -> goals conceded in each earlier match
     all_goals = []
-    predictions = []
     by_date = {}
     for m in matches:
         by_date.setdefault(m["Date"], []).append(m)
 
+    def average(goals, fallback):
+        if window is not None:
+            goals = goals[-window:]
+        return sum(goals) / len(goals) if goals else fallback
+
+    result_ratings = []
     for day in sorted(by_date):
         for m in by_date[day]:
             fallback = sum(all_goals) / len(all_goals) if all_goals else 1.0
-            averages = []
-            for team in (m["HomeTeam"], m["AwayTeam"]):
-                goals = history.get(team, [])
-                if window is not None:
-                    goals = goals[-window:]
-                averages.append(sum(goals) / len(goals) if goals else fallback)
-            predictions.append((m, averages[0], averages[1]))
+            result_ratings.append(tuple(
+                (average(scored.get(team, []), fallback),
+                 average(conceded.get(team, []), fallback))
+                for team in (m["HomeTeam"], m["AwayTeam"])))
         for m in by_date[day]:
-            for team, goals in ((m["HomeTeam"], m["HomeGoals"]),
-                                (m["AwayTeam"], m["AwayGoals"])):
-                history.setdefault(team, []).append(int(goals))
-                all_goals.append(int(goals))
-    return predictions
+            home, away = int(m["HomeGoals"]), int(m["AwayGoals"])
+            for team, goals_for, goals_against in (
+                    (m["HomeTeam"], home, away), (m["AwayTeam"], away, home)):
+                scored.setdefault(team, []).append(goals_for)
+                conceded.setdefault(team, []).append(goals_against)
+            all_goals += [home, away]
+    return result_ratings
+
+
+def scored_only(home, away):
+    return home[0], away[0]
+
+
+def offence_defence(home, away):
+    return (home[0] + away[1]) / 2, (away[0] + home[1]) / 2
+
+
+METHODS = {"Scored only": scored_only, "Offence + defence": offence_defence}
+
+
+def predict(matches, window, method):
+    """(match, predicted home goals, predicted away goals) before rounding."""
+    return [(m, *method(home, away))
+            for m, (home, away) in zip(matches, ratings(matches, window))]
 
 
 def metrics(rows):
@@ -111,9 +142,9 @@ def print_table(columns):
         ("draws", "Draws predicted", "{}"),
     ]
     names = list(columns)
-    print(f"{'':32}" + "".join(f"{n:>14}" for n in names))
+    print(f"{'':32}" + "".join(f"{n:>19}" for n in names))
     for key, label, fmt in labels:
-        print(f"{label:32}" + "".join(f"{fmt.format(columns[n][key]):>14}"
+        print(f"{label:32}" + "".join(f"{fmt.format(columns[n][key]):>19}"
                                       for n in names))
 
 
@@ -123,20 +154,25 @@ def main():
     matches = train + validation + test
     start_val, start_test = len(train), len(train) + len(validation)
 
-    print("Choosing the window on validation (result correct):")
-    best = None
-    for window in WINDOWS:
-        rows = rounded(predict(matches, window))[start_val:start_test]
-        accuracy = metrics(rows)["result_accuracy"]
-        label = "all" if window is None else f"last {window}"
-        print(f"  {label:>8} matches: {accuracy:.1%}")
-        if best is None or accuracy > best[0]:
-            best = (accuracy, window, label)
-    _, window, label = best
-    print(f"Chosen: {label} matches\n")
-
-    raw = predict(matches, window)[start_test:]
-    columns = {"Average": metrics(rounded(raw))}
+    columns = {}
+    unrounded = {}
+    for name, method in METHODS.items():
+        print(f"{name}: choosing the window on validation (result correct):")
+        best = None
+        for window in WINDOWS:
+            rows = rounded(predict(matches, window, method))
+            accuracy = metrics(rows[start_val:start_test])["result_accuracy"]
+            label = "all" if window is None else f"last {window}"
+            print(f"  {label:>8} matches: {accuracy:.1%}")
+            if best is None or accuracy > best[0]:
+                best = (accuracy, window, label)
+        _, window, label = best
+        print(f"Chosen: {label} matches\n")
+        raw = predict(matches, window, method)[start_test:]
+        columns[name] = metrics(rounded(raw))
+        unrounded[name] = metrics(raw)
+        if method is offence_defence:
+            chosen_window = window
 
     # The Poisson model's predicted scores, if predict_scores.py has run.
     poisson_path = os.path.join(HERE, "test_predictions.csv")
@@ -152,25 +188,30 @@ def main():
           f"{sum(m['Result'] == 'D' for m in test)} actual draws), "
           "predicted scores:")
     print_table(columns)
-    unrounded = metrics(raw)
-    print(f"\nBefore rounding, the averages have goals MAE "
-          f"{unrounded['goals_mae']:.3f} and RMSE "
-          f"{unrounded['goals_rmse']:.3f} per team.")
+    print("\nBefore rounding, goals MAE / RMSE per team:")
+    for name, values in unrounded.items():
+        print(f"  {name}: {values['goals_mae']:.3f} / "
+              f"{values['goals_rmse']:.3f}")
 
+    # Write the offence + defence predictions with the ratings behind them.
     out = os.path.join(HERE, "test_predictions_average.csv")
+    test_ratings = ratings(matches, chosen_window)[start_test:]
     with open(out, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["Season", "Date", "HomeTeam", "AwayTeam",
                          "HomeGoals", "AwayGoals", "Result",
-                         "AvgHomeGoals", "AvgAwayGoals",
+                         "HomeOffence", "HomeDefence",
+                         "AwayOffence", "AwayDefence",
+                         "ExpHomeGoals", "ExpAwayGoals",
                          "PredHomeGoals", "PredAwayGoals", "PredResult"])
-        for m, h, a in raw:
+        for m, (home, away) in zip(test, test_ratings):
+            h, a = offence_defence(home, away)
             ph, pa = round_half_up(h), round_half_up(a)
             writer.writerow([m["Season"], m["Date"], m["HomeTeam"],
                              m["AwayTeam"], m["HomeGoals"], m["AwayGoals"],
-                             m["Result"], f"{h:.3f}", f"{a:.3f}", ph, pa,
-                             result(ph, pa)])
-    print(f"Wrote predictions to {out}")
+                             m["Result"], *(f"{r:.3f}" for r in home + away),
+                             f"{h:.3f}", f"{a:.3f}", ph, pa, result(ph, pa)])
+    print(f"Wrote offence + defence predictions to {out}")
 
 
 if __name__ == "__main__":

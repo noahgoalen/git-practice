@@ -18,7 +18,8 @@ URL = "https://www.football-data.co.uk/mmz4281/{}/E0.csv"
 OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                       "premier_league_results.csv")
 COLUMNS = ["Season", "Date", "HomeTeam", "AwayTeam",
-           "HomeGoals", "AwayGoals", "Result"]
+           "HomeGoals", "AwayGoals", "Result",
+           "HomeShotsOnTarget", "AwayShotsOnTarget"]
 
 
 def parse_date(text):
@@ -52,6 +53,8 @@ def fetch_season(code):
             "HomeGoals": int(row["FTHG"]),
             "AwayGoals": int(row["FTAG"]),
             "Result": row["FTR"],  # H = home win, D = draw, A = away win
+            "HomeShotsOnTarget": int(row["HST"]),
+            "AwayShotsOnTarget": int(row["AST"]),
         })
     return rows
 

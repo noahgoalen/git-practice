@@ -4,7 +4,7 @@ Each team has two ratings, taken from its previous matches:
     offensive rating: average goals it scored
     defensive rating: average goals it conceded (higher is worse)
 
-Five ways of predicting a team's goals in a match are compared:
+Six ways of predicting a team's goals in a match are compared:
     "Scored only":       its offensive rating
     "Offence + defence": the average of its offensive rating and the
                          opponent's defensive rating
@@ -21,15 +21,26 @@ Five ways of predicting a team's goals in a match are compared:
                          the league's goals-per-shot-on-target rate at that
                          venue. Shots on target are a steadier measure of how
                          well a team plays than goals, which are noisier
+    "Goals + shots":     a weighted average of the home/away split and shots
+                         on target predictions, with the weight chosen on
+                         validation
 The first two use all previous matches, home and away alike. The prediction
 is rounded to the nearest whole number, and the predicted result follows
 from the two rounded scores, so equal scores mean a draw.
 
-"Previous matches" can be every earlier match in the data or only the most
-recent few (counted at that venue for the home/away split). The window is
-chosen on the validation seasons (by how often the result is right),
-separately for each method, then the test season is predicted once with it.
-Only matches before the one being predicted are ever used.
+Ratings are weighted averages: every earlier match counts, but its weight
+halves every "half-life" days, so recent form matters most. A newly promoted
+team is rated afresh: its matches from before promotion are ignored, and it
+starts from the average record of earlier promoted teams in their first
+season, counted as PROMOTED_PRIOR_MATCHES matches. Its own results take over
+as the season goes on.
+
+The half-life (and, for "Goals + shots", the weight) is chosen on the
+validation seasons, separately for each method, by the error in predicted
+goals before rounding (RMSE). That uses the size of every miss, so it is
+much steadier than how often the rounded result is right. The test season is
+then predicted once with the chosen settings. Only matches before the one
+being predicted are ever used.
 
 Run split_data.py (and predict_scores.py, for the comparison) first, then:
     python average_model.py
@@ -39,9 +50,16 @@ Output:  test_predictions_average.csv (next to this script) plus metrics.
 import csv
 import math
 import os
+from datetime import date
+
+import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-WINDOWS = [5, 10, 19, 38, None]  # last N matches; None means all of them
+HALF_LIVES = [60, 120, 240, 365, 730, None]  # days; None means no decay
+BLENDS = [0, 0.25, 0.5, 0.75, 1]  # share of goals in "Goals + shots"
+PROMOTED_PRIOR_MATCHES = 2  # weight of a promoted team's starting rating, in matches
+ADJUST_ROUNDS = 20  # enough for the opponent adjustment to settle
+DEFAULT_CONVERSION = 0.32  # goals per shot on target, before any data
 
 
 def load(name):
@@ -60,114 +78,163 @@ def result(home_goals, away_goals):
     return "D" if home_goals == away_goals else "A"
 
 
-OTHER_VENUE = {"Home": "Away", "Away": "Home", "All": "All"}
-ADJUST_ROUNDS = 20  # enough for the opponent adjustment to settle
+def promoted_seasons(matches):
+    """team -> indices of the seasons it was newly promoted into.
 
-
-def opponent_adjusted(history, window, scored_base, conceded_base):
-    """Offensive and defensive ratings adjusted for the opponents faced.
-
-    Scoring 3 against a leaky defence is worth less than scoring 3 against a
-    tight one. So each goal tally is corrected by how far the opponent's
-    defensive rating is from the league average (and each goals-conceded
-    tally by the opponent's offensive rating), and every team is re-rated
-    with the corrected numbers. The opponents' ratings depend on their own
-    opponents, so this is repeated until the ratings settle.
-
-    history: (team, venue) -> [(goals for, goals against, opponent key)]
-    scored_base / conceded_base: venue -> league average goals scored /
-    conceded at that venue.
+    A team is promoted if it did not play in the previous season. The first
+    season in the data has no previous season, so nobody is promoted there.
     """
-    recent = {key: matches[-window:] if window is not None else matches
-              for key, matches in history.items()}
-    offence = {k: sum(gf for gf, _, _ in ms) / len(ms)
-               for k, ms in recent.items()}
-    defence = {k: sum(ga for _, ga, _ in ms) / len(ms)
-               for k, ms in recent.items()}
-    for _ in range(ADJUST_ROUNDS):
-        offence, defence = (
-            {(team, venue): sum(gf - (defence[opp] - scored_base[venue])
-                                for gf, _, opp in ms) / len(ms)
-             for (team, venue), ms in recent.items()},
-            {(team, venue): sum(ga - (offence[opp] - conceded_base[venue])
-                                for _, ga, opp in ms) / len(ms)
-             for (team, venue), ms in recent.items()})
-    return offence, defence
+    seasons = sorted({m["Season"] for m in matches})
+    teams = [{t for m in matches if m["Season"] == s
+              for t in (m["HomeTeam"], m["AwayTeam"])} for s in seasons]
+    promoted = {}
+    for k in range(1, len(seasons)):
+        for team in teams[k] - teams[k - 1]:
+            promoted.setdefault(team, []).append(k)
+    return seasons, promoted
 
 
-def ratings(matches, window, by_venue=False, adjust_from=None, stat="Goals"):
+def ratings(matches, half_life, by_venue=False, adjusted=False,
+            stat="Goals", rate_from=None):
     """Each team's (offensive, defensive) rating before every match.
 
-    stat is what is averaged: "Goals" (goals scored and conceded) or
-    "ShotsOnTarget" (shots on target taken and faced).
-
     Returns one ((home off, home def), (away off, away def)) per match, using
-    only earlier matches. With by_venue, the home team is rated on its home
-    matches only and the away team on its away matches only. Matches on the
-    same day are rated before any of them are added to the history.
+    only matches on earlier days.
 
-    From the date adjust_from onwards (if given) the ratings are adjusted for
-    opponent strength; before that, plain averages are returned, which saves
-    time on matches that are never scored.
+    half_life: days for a match's weight to halve; None weights all equally.
+    by_venue: rate the home team on its home matches only and the away team
+        on its away matches only.
+    adjusted: adjust the ratings for opponent strength (opponent_adjusted).
+    stat: what is averaged, "Goals" or "ShotsOnTarget" (taken and faced).
+    rate_from: date from which to compute ratings. Earlier matches get the
+        league average, which saves time on matches that are never scored.
 
-    A team with no earlier matches (at that venue, with by_venue) gets the
-    league average instead: average goals per team overall, or with by_venue
-    the average home or away goals as fits the rating.
+    A team with no usable earlier matches (at that venue, with by_venue) gets
+    the league average, or the promoted-team starting rating if it has just
+    been promoted.
     """
-    # (team, venue) -> (goals for, goals against, opponent key) per earlier
-    # match, oldest first. Venue is "Home", "Away" or "All".
-    history = {}
-    goals = {"Home": [], "Away": []}  # every earlier home and away score
+    seasons, promoted = promoted_seasons(matches)
+    season_index = {s: k for k, s in enumerate(seasons)}
+    teams = sorted({t for m in matches for t in (m["HomeTeam"], m["AwayTeam"])})
+    team_index = {t: i for i, t in enumerate(teams)}
+    n_keys = len(teams) * (2 if by_venue else 1)
+
+    def key(team, venue):  # venue 0 = home, 1 = away
+        return team_index[team] * 2 + venue if by_venue else team_index[team]
+
+    # The venue each key's ratings come from (2 = home and away together).
+    key_venue = (np.tile([0, 1], len(teams)) if by_venue
+                 else np.full(n_keys, 2))
+    key_team = np.arange(n_keys) // (2 if by_venue else 1)
+
+    # One record per team per earlier match: the key rated, the opponent's
+    # key, the stat for and against, the day and the season.
+    records = {name: [] for name in ("key", "opp", "for", "against", "day",
+                                     "season", "promoted")}
+    totals = np.zeros((2, 2))  # [home, away] x [stat sum, matches]
     by_date = {}
     for m in matches:
         by_date.setdefault(m["Date"], []).append(m)
 
-    def average(values):
-        return sum(values) / len(values)
-
     result_ratings = []
     for day in sorted(by_date):
-        all_goals = goals["Home"] + goals["Away"]
-        league = {"Home": average(goals["Home"]) if all_goals else 1.0,
-                  "Away": average(goals["Away"]) if all_goals else 1.0,
-                  "All": average(all_goals) if all_goals else 1.0}
-        conceded_base = {v: league[OTHER_VENUE[v]] for v in league}
+        today = date.fromisoformat(day).toordinal()
+        season = season_index[by_date[day][0]["Season"]]
+        league = np.where(totals[:, 1] > 0,
+                          totals[:, 0] / np.maximum(totals[:, 1], 1), 1.0)
+        # Average stat for and against at each venue code 0, 1, 2.
+        scored_base = np.array([league[0], league[1], league.mean()])
+        conceded_base = np.array([league[1], league[0], league.mean()])
 
-        venues = ("Home", "Away") if by_venue else ("All",)
-        venue_history = {k: v for k, v in history.items() if k[1] in venues}
-        if adjust_from is not None and day >= adjust_from:
-            offence, defence = opponent_adjusted(venue_history, window,
-                                                 league, conceded_base)
+        if rate_from is not None and day < rate_from or not records["key"]:
+            offence = scored_base[key_venue]
+            defence = conceded_base[key_venue]
         else:
-            recent = {k: ms[-window:] if window is not None else ms
-                      for k, ms in venue_history.items()}
-            offence = {k: average([gf for gf, _, _ in ms])
-                       for k, ms in recent.items()}
-            defence = {k: average([ga for _, ga, _ in ms])
-                       for k, ms in recent.items()}
+            r = {name: np.array(values) for name, values in records.items()}
+            weights = (np.ones(len(r["key"])) if half_life is None
+                       else 0.5 ** ((today - r["day"]) / half_life))
+            # A team's matches before its latest promotion are ignored.
+            latest = np.array([max([k for k in promoted.get(t, [])
+                                    if k <= season], default=-1)
+                               for t in teams])
+            weights[r["season"] < latest[key_team[r["key"]]]] = 0
+
+            # Starting rating for teams promoted this season: what earlier
+            # promoted teams averaged in their first season, by venue.
+            prior_offence = scored_base[key_venue].copy()
+            prior_defence = conceded_base[key_venue].copy()
+            earlier = r["promoted"] & (r["season"] < season)
+            for venue in (0, 1, 2):
+                mask = earlier & (key_venue[r["key"]] == venue)
+                if mask.any():
+                    prior_offence[key_venue == venue] = r["for"][mask].mean()
+                    prior_defence[key_venue == venue] = (
+                        r["against"][mask].mean())
+            prior_weight = np.where(latest[key_team] == season,
+                                    PROMOTED_PRIOR_MATCHES, 0.0)
+
+            total_weight = np.bincount(r["key"], weights, n_keys)
+
+            def average(values, prior, fallback):
+                sums = np.bincount(r["key"], weights * values, n_keys)
+                total = total_weight + prior_weight
+                return np.where(total > 0,
+                                (sums + prior_weight * prior)
+                                / np.maximum(total, 1e-12), fallback)
+
+            fallback_offence = scored_base[key_venue]
+            fallback_defence = conceded_base[key_venue]
+            offence = average(r["for"], prior_offence, fallback_offence)
+            defence = average(r["against"], prior_defence, fallback_defence)
+            if adjusted:
+                offence, defence = opponent_adjusted(
+                    r, average, offence, defence, prior_offence,
+                    prior_defence, fallback_offence, fallback_defence,
+                    scored_base[key_venue], conceded_base[key_venue])
 
         for m in by_date[day]:
-            rated = []
-            for side in ("Home", "Away"):
-                key = (m[f"{side}Team"], side if by_venue else "All")
-                venue = key[1]
-                rated.append((offence.get(key, league[venue]),
-                              defence.get(key, conceded_base[venue])))
-            result_ratings.append(tuple(rated))
+            home, away = key(m["HomeTeam"], 0), key(m["AwayTeam"], 1)
+            result_ratings.append(((offence[home], defence[home]),
+                                   (offence[away], defence[away])))
 
         for m in by_date[day]:
             home, away = int(m[f"Home{stat}"]), int(m[f"Away{stat}"])
-            for team, opponent, venue, goals_for, goals_against in (
-                    (m["HomeTeam"], m["AwayTeam"], "Home", home, away),
-                    (m["AwayTeam"], m["HomeTeam"], "Away", away, home)):
-                history.setdefault((team, "All"), []).append(
-                    (goals_for, goals_against, (opponent, "All")))
-                history.setdefault((team, venue), []).append(
-                    (goals_for, goals_against,
-                     (opponent, OTHER_VENUE[venue])))
-            goals["Home"].append(home)
-            goals["Away"].append(away)
+            for team, opponent, venue, stat_for, stat_against in (
+                    (m["HomeTeam"], m["AwayTeam"], 0, home, away),
+                    (m["AwayTeam"], m["HomeTeam"], 1, away, home)):
+                records["key"].append(key(team, venue))
+                records["opp"].append(key(opponent, 1 - venue))
+                records["for"].append(stat_for)
+                records["against"].append(stat_against)
+                records["day"].append(today)
+                records["season"].append(season)
+                records["promoted"].append(season in promoted.get(team, []))
+            totals[0] += (home, 1)
+            totals[1] += (away, 1)
     return result_ratings
+
+
+def opponent_adjusted(r, average, offence, defence, prior_offence,
+                      prior_defence, fallback_offence, fallback_defence,
+                      key_scored_base, key_conceded_base):
+    """Offensive and defensive ratings adjusted for the opponents faced.
+
+    Scoring 3 against a leaky defence is worth less than scoring 3 against a
+    tight one. So each tally for is corrected by how far the opponent's
+    defensive rating is from the league average (and each tally against by
+    the opponent's offensive rating), and every team is re-rated with the
+    corrected numbers. The opponents' ratings depend on their own opponents,
+    so this is repeated until the ratings settle.
+    """
+    base_for = key_scored_base[r["key"]]
+    base_against = key_conceded_base[r["key"]]
+    for _ in range(ADJUST_ROUNDS):
+        offence, defence = (
+            average(r["for"] - (defence[r["opp"]] - base_for),
+                    prior_offence, fallback_offence),
+            average(r["against"] - (offence[r["opp"]] - base_against),
+                    prior_defence, fallback_defence))
+    return offence, defence
 
 
 def scored_only(home, away):
@@ -178,18 +245,23 @@ def offence_defence(home, away):
     return (home[0] + away[1]) / 2, (away[0] + home[1]) / 2
 
 
-# name -> (how ratings become a prediction, whether ratings are split by
-#          venue, whether they are adjusted for opponent strength,
-#          what they are averaged from)
+# name -> how ratings become a prediction, whether ratings are split by
+# venue, whether they are adjusted for opponent strength, and what they are
+# averaged from. "blend" methods mix the predictions of two other methods.
 METHODS = {
-    "Scored only": (scored_only, False, False, "Goals"),
-    "Offence + defence": (offence_defence, False, False, "Goals"),
-    "Home/away split": (offence_defence, True, False, "Goals"),
-    "Opponent-adjusted": (offence_defence, True, True, "Goals"),
-    "Shots on target": (offence_defence, True, False, "ShotsOnTarget"),
+    "Scored only": dict(formula=scored_only, by_venue=False,
+                        adjusted=False, stat="Goals"),
+    "Offence + defence": dict(formula=offence_defence, by_venue=False,
+                              adjusted=False, stat="Goals"),
+    "Home/away split": dict(formula=offence_defence, by_venue=True,
+                            adjusted=False, stat="Goals"),
+    "Opponent-adjusted": dict(formula=offence_defence, by_venue=True,
+                              adjusted=True, stat="Goals"),
+    "Shots on target": dict(formula=offence_defence, by_venue=True,
+                            adjusted=False, stat="ShotsOnTarget"),
+    "Goals + shots": dict(blend=("Home/away split", "Shots on target")),
 }
-SAVED_METHOD = "Shots on target"  # written to test_predictions_average.csv
-DEFAULT_CONVERSION = 0.32  # goals per shot on target, before any data
+SAVED_METHOD = "Goals + shots"  # written to test_predictions_average.csv
 
 
 def conversion_rates(matches):
@@ -199,30 +271,66 @@ def conversion_rates(matches):
     match.
     """
     totals = {"Home": [0, 0], "Away": [0, 0]}  # venue -> [goals, on target]
+    by_date = {}
+    for m in matches:
+        by_date.setdefault(m["Date"], []).append(m)
     rates = {}
-    for day in sorted({m["Date"] for m in matches}):
+    for day in sorted(by_date):
         rates[day] = tuple(goals / shots if shots else DEFAULT_CONVERSION
                            for goals, shots in totals.values())
-        for m in matches:
-            if m["Date"] == day:
-                for venue, total in totals.items():
-                    total[0] += int(m[f"{venue}Goals"])
-                    total[1] += int(m[f"{venue}ShotsOnTarget"])
+        for m in by_date[day]:
+            for venue, total in totals.items():
+                total[0] += int(m[f"{venue}Goals"])
+                total[1] += int(m[f"{venue}ShotsOnTarget"])
     return [rates[m["Date"]] for m in matches]
 
 
-def predict(matches, window, method, adjust_from):
-    """(match, predicted home goals, predicted away goals) before rounding."""
-    formula, by_venue, adjusted, stat = method
-    rated = ratings(matches, window, by_venue,
-                    adjust_from if adjusted else None, stat)
-    predictions = [formula(home, away) for home, away in rated]
-    if stat == "ShotsOnTarget":
+def predict(matches, method, half_life, rate_from):
+    """(match, predicted home goals, predicted away goals) before rounding.
+
+    Not for blend methods; see predict_all.
+    """
+    rated = ratings(matches, half_life, method["by_venue"],
+                    method["adjusted"], method["stat"], rate_from)
+    predictions = [method["formula"](home, away) for home, away in rated]
+    if method["stat"] == "ShotsOnTarget":
         # Expected shots on target -> expected goals.
         predictions = [(h * home_rate, a * away_rate) for (h, a),
                        (home_rate, away_rate)
                        in zip(predictions, conversion_rates(matches))]
     return [(m, h, a) for m, (h, a) in zip(matches, predictions)]
+
+
+def predict_all(matches, name, rate_from):
+    """Predictions for every setting of a method: {setting: rows}.
+
+    A setting is (half-life, blend weight); the weight is None unless the
+    method is a blend.
+    """
+    method = METHODS[name]
+    if "blend" not in method:
+        return {(h, None): predict(matches, method, h, rate_from)
+                for h in HALF_LIVES}
+    first, second = method["blend"]
+    out = {}
+    for h in HALF_LIVES:
+        a = predict(matches, METHODS[first], h, rate_from)
+        b = predict(matches, METHODS[second], h, rate_from)
+        for w in BLENDS:
+            out[h, w] = [(m, w * ha + (1 - w) * hb, w * aa + (1 - w) * ab)
+                         for (m, ha, aa), (_, hb, ab) in zip(a, b)]
+    return out
+
+
+def validation_error(rows):
+    """What settings are chosen by: goals RMSE before rounding (lower wins)."""
+    return metrics(rows)["goals_rmse"]
+
+
+def setting_label(setting):
+    half_life, blend = setting
+    label = "no decay" if half_life is None else f"{half_life}d"
+    return label if blend is None else f"{label}, {blend:.0%} goals"
 
 
 def metrics(rows):
@@ -276,27 +384,25 @@ def main():
                                ("train", "validation", "test"))
     matches = train + validation + test
     start_val, start_test = len(train), len(train) + len(validation)
-    adjust_from = validation[0]["Date"]  # no need to adjust earlier matches
+    rate_from = validation[0]["Date"]  # earlier matches are never scored
 
     columns = {}
     unrounded = {}
-    for name, method in METHODS.items():
-        print(f"{name}: choosing the window on validation (result correct):")
-        best = None
-        for window in WINDOWS:
-            rows = rounded(predict(matches, window, method, adjust_from))
-            accuracy = metrics(rows[start_val:start_test])["result_accuracy"]
-            label = "all" if window is None else f"last {window}"
-            print(f"  {label:>8} matches: {accuracy:.1%}")
-            if best is None or accuracy > best[0]:
-                best = (accuracy, window, label)
-        _, window, label = best
-        print(f"Chosen: {label} matches\n")
-        raw = predict(matches, window, method, adjust_from)[start_test:]
+    for name in METHODS:
+        print(f"{name}: choosing the settings on validation "
+              "(goals RMSE before rounding, lower is better):")
+        by_setting = predict_all(matches, name, rate_from)
+        errors = {s: validation_error(rows[start_val:start_test])
+                  for s, rows in by_setting.items()}
+        for s, error in errors.items():
+            print(f"  {setting_label(s):>20}: {error:.4f}")
+        setting = min(errors, key=errors.get)
+        print(f"Chosen: {setting_label(setting)}\n")
+        raw = by_setting[setting][start_test:]
         columns[name] = metrics(rounded(raw))
         unrounded[name] = metrics(raw)
         if name == SAVED_METHOD:
-            chosen_window = window
+            saved = raw
 
     # The Poisson model's predicted scores, if predict_scores.py has run.
     poisson_path = os.path.join(HERE, "test_predictions.csv")
@@ -318,29 +424,19 @@ def main():
         print(f"  {name}: {values['goals_mae']:.3f} / "
               f"{values['goals_rmse']:.3f}, {values['result_accuracy']:.1%}")
 
-    # Write one method's predictions with the ratings behind them.
     out = os.path.join(HERE, "test_predictions_average.csv")
-    method = METHODS[SAVED_METHOD]
-    _, by_venue, adjusted, stat = method
-    test_ratings = ratings(matches, chosen_window, by_venue,
-                           adjust_from if adjusted else None,
-                           stat)[start_test:]
-    test_predictions = predict(matches, chosen_window, method,
-                               adjust_from)[start_test:]
     with open(out, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["Season", "Date", "HomeTeam", "AwayTeam",
                          "HomeGoals", "AwayGoals", "Result",
-                         f"HomeOffence{stat}", f"HomeDefence{stat}",
-                         f"AwayOffence{stat}", f"AwayDefence{stat}",
                          "ExpHomeGoals", "ExpAwayGoals",
                          "PredHomeGoals", "PredAwayGoals", "PredResult"])
-        for (m, h, a), (home, away) in zip(test_predictions, test_ratings):
+        for m, h, a in saved:
             ph, pa = round_half_up(h), round_half_up(a)
             writer.writerow([m["Season"], m["Date"], m["HomeTeam"],
                              m["AwayTeam"], m["HomeGoals"], m["AwayGoals"],
-                             m["Result"], *(f"{r:.3f}" for r in home + away),
-                             f"{h:.3f}", f"{a:.3f}", ph, pa, result(ph, pa)])
+                             m["Result"], f"{h:.3f}", f"{a:.3f}", ph, pa,
+                             result(ph, pa)])
     print(f"Wrote {SAVED_METHOD} predictions to {out}")
 
 

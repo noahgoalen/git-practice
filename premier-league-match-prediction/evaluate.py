@@ -14,8 +14,8 @@ season of history before its validation seasons, so the test seasons run
 from 2019-20 to 2025-26.
 
 Each model chooses its settings the same way as in its own script: the
-average models by validation result accuracy, the Poisson model by
-validation log-likelihood of the goals.
+average models by validation goals RMSE before rounding, the Poisson model
+by validation log-likelihood of the goals.
 
 Run download_results.py first, then:  python evaluate.py
 It takes several minutes.
@@ -45,17 +45,15 @@ def average_model_predictions(matches, fold_list):
     """Test-season predictions per average method, one fold at a time."""
     first_scored = matches[fold_list[0][0][0]]["Date"]
     results = {}
-    for name, method in avg.METHODS.items():
+    for name in avg.METHODS:
         print(f"  {name}")
-        by_window = {w: avg.predict(matches, w, method, first_scored)
-                     for w in avg.WINDOWS}
+        by_setting = avg.predict_all(matches, name, first_scored)
         rows, chosen = [], []
         for validation, test, _ in fold_list:
-            window = max(avg.WINDOWS, key=lambda w: avg.metrics(
-                avg.rounded([by_window[w][i] for i in validation])
-            )["result_accuracy"])
-            rows.append([by_window[window][i] for i in test])
-            chosen.append("all" if window is None else str(window))
+            setting = min(by_setting, key=lambda s: avg.validation_error(
+                [by_setting[s][i] for i in validation]))
+            rows.append([by_setting[setting][i] for i in test])
+            chosen.append(avg.setting_label(setting))
         results[name] = (rows, chosen)
     return results
 
@@ -123,11 +121,11 @@ def main():
     chosen["Poisson"] = p_chosen
 
     n = sum(len(r) for r in p_rows)
-    print(f"\nSettings chosen on validation for each test season "
-          f"(window, or half-life/penalty):")
-    print(f"{'':20}" + "".join(f"{s:>12}" for s in test_seasons))
+    print("\nSettings chosen on validation for each test season "
+          "(half-life, or half-life/penalty):")
+    print(f"{'':20}" + "".join(f"{s:>18}" for s in test_seasons))
     for name, values in chosen.items():
-        print(f"{name:20}" + "".join(f"{v:>12}" for v in values))
+        print(f"{name:20}" + "".join(f"{v:>18}" for v in values))
 
     print(f"\nAll {len(test_seasons)} test seasons together ({n} matches), "
           "predicted scores:")

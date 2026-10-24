@@ -25,8 +25,17 @@ must be shared under the same licence.
 
 ```
 pip install -r requirements.txt
-jupyter notebook eda.ipynb   # exploratory data analysis
+jupyter notebook eda.ipynb             # exploratory data analysis
+jupyter notebook elo_prediction.ipynb  # Elo model predicting ATP match winners
 ```
 
 The notebook downloads the data files it needs (about 240 MB) into `data/`
 on its first run. `data/` is not committed to git.
+
+### ATP results for the Elo notebook
+
+`elo_prediction.ipynb` uses every ATP tour-level match from the yearly files
+at [tennis-data.co.uk](http://www.tennis-data.co.uk/alldata.php), stored in
+`atp_data/` (one `.xls`/`.xlsx` per year). The site blocks automated
+downloads, so new years have to be downloaded in a browser and added to that
+folder; the notebook picks up every file there.

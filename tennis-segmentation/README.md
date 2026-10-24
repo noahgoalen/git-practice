@@ -27,7 +27,8 @@ must be shared under the same licence.
 pip install -r requirements.txt
 jupyter notebook eda.ipynb             # exploratory data analysis
 jupyter notebook elo_prediction.ipynb  # Elo model predicting ATP match winners
-jupyter notebook nmf.ipynb             # player-vs-player matrix for NMF
+jupyter notebook nmf.ipynb             # player-vs-player matrices for NMF
+jupyter notebook style_embedding.ipynb # 5-d play-style embeddings and similarities
 ```
 
 The notebook downloads the data files it needs (about 240 MB) into `data/`

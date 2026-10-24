@@ -20,3 +20,13 @@ must be shared under the same licence.
 > is licensed under a Creative Commons Attribution-NonCommercial-ShareAlike
 > 4.0 International License. Based on a work at
 > https://github.com/JeffSackmann/tennis_MatchChartingProject
+
+## Usage
+
+```
+pip install -r requirements.txt
+jupyter notebook eda.ipynb   # exploratory data analysis
+```
+
+The notebook downloads the data files it needs (about 240 MB) into `data/`
+on its first run. `data/` is not committed to git.
